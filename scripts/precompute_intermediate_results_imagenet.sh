@@ -3,10 +3,10 @@ for MODEL in  "resnet50"
 
 
 do
-
 python pytorch-image-models/precompute_intermediate_results.py \
     --data_dir "/home/miao/datasets/ImageNet" \
+    --dataset "imagenet" \
     --model $MODEL \
     --output_dir "intermediate_output/imagenet" \
-    --split "val" \
+    --split "val" 
 done

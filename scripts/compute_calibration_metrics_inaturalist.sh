@@ -1,6 +1,6 @@
 for MODEL in 'resnet50_from_scratch_inat2021_val' 'resnet50_pretrain_imagenet_train_inat2021_val' 
 do
-for SEED in 2020 2021 2022 2023 2024
+for SEED in 2021 # 2020 2021 2022 2023 2024
 do
 # "/home/miao/repo2022/yeeef/classifier-balancing/output/" 
 python compute_calibration_metrics_long_tail_inaturalist.py  \

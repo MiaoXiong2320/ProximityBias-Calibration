@@ -1,1 +1,9 @@
 *.p
+*.pyc
+*.npz
+res_dir
+plots
+train_model_output
+intermediate_output
+pytorch-image-models/intermediate_output
+vis_*.py

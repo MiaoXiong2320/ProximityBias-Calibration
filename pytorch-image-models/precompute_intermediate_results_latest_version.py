@@ -11,32 +11,34 @@ canonical PyTorch, standard Python style, and good performance. Repurpose as you
 Hacked together by Ross Wightman (https://github.com/rwightman)
 """
 import argparse
-import os
 import csv
 import glob
 import json
-import time
 import logging
+import os
+import time
+from collections import OrderedDict
+from contextlib import suppress
+from functools import partial
+import pickle, pdb
 import torch
 import torch.nn as nn
 import torch.nn.parallel
-from collections import OrderedDict
-from contextlib import suppress
 import torch.nn.functional as F
+
 import numpy as np
-import pickle, pdb
 
-from timm.models import create_model, load_checkpoint, is_model, list_models
 from timm.data import create_dataset, create_loader, resolve_data_config, RealLabelsImagenet
-from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser,\
-    decay_batch_step, check_batch_size_retry
+from timm.layers import apply_test_time_pool, set_fast_norm
+from timm.models import create_model, load_checkpoint, is_model, list_models
+from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser, \
+    decay_batch_step, check_batch_size_retry, ParseKwargs, reparameterize_model
 
-has_apex = False
 try:
     from apex import amp
     has_apex = True
 except ImportError:
-    pass
+    has_apex = False
 
 has_native_amp = False
 try:
@@ -52,6 +54,8 @@ except ImportError as e:
     has_functorch = False
 
 torch.backends.cudnn.benchmark = True
+
+has_compile = hasattr(torch, 'compile')
 _logger = logging.getLogger('validate')
 
 
@@ -82,12 +86,16 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('--img-size', default=None, type=int,
                     metavar='N', help='Input image dimension, uses model default if empty')
+parser.add_argument('--in-chans', type=int, default=None, metavar='N',
+                    help='Image input channels (default: None => 3)')
 parser.add_argument('--input-size', default=None, nargs=3, type=int,
                     metavar='N N N', help='Input all image dimensions (d h w, e.g. --input-size 3 224 224), uses model default if empty')
 parser.add_argument('--use-train-size', action='store_true', default=False,
                     help='force use of train input size, even when test size is specified in pretrained cfg')
 parser.add_argument('--crop-pct', default=None, type=float,
                     metavar='N', help='Input image center crop pct')
+parser.add_argument('--crop-mode', default=None, type=str,
+                    metavar='N', help='Input image crop mode (squash, border, center). Model default if None.')
 parser.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
                     help='Override mean pixel value of dataset')
 parser.add_argument('--std', type=float,  nargs='+', default=None, metavar='STD',
@@ -106,7 +114,7 @@ parser.add_argument('--checkpoint', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
-parser.add_argument('--num-gpu', type=int, default=4,
+parser.add_argument('--num-gpu', type=int, default=3,
                     help='Number of GPUS to use')
 parser.add_argument('--test-pool', dest='test_pool', action='store_true',
                     help='enable test time pool')
@@ -116,27 +124,44 @@ parser.add_argument('--pin-mem', action='store_true', default=False,
                     help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
 parser.add_argument('--channels-last', action='store_true', default=False,
                     help='Use channels_last memory layout')
+parser.add_argument('--device', default='cuda', type=str,
+                    help="Device (accelerator) to use.")
 parser.add_argument('--amp', action='store_true', default=False,
-                    help='Use AMP mixed precision. Defaults to Apex, fallback to native Torch AMP.')
-parser.add_argument('--apex-amp', action='store_true', default=False,
-                    help='Use NVIDIA Apex AMP mixed precision')
-parser.add_argument('--native-amp', action='store_true', default=False,
-                    help='Use Native Torch AMP mixed precision')
+                    help='use NVIDIA Apex AMP or Native AMP for mixed precision training')
+parser.add_argument('--amp-dtype', default='float16', type=str,
+                    help='lower precision AMP dtype (default: float16)')
+parser.add_argument('--amp-impl', default='native', type=str,
+                    help='AMP impl to use, "native" or "apex" (default: native)')
 parser.add_argument('--tf-preprocessing', action='store_true', default=False,
                     help='Use Tensorflow preprocessing pipeline (require CPU TF installed')
 parser.add_argument('--use-ema', dest='use_ema', action='store_true',
                     help='use ema version of weights if present')
-scripting_group = parser.add_mutually_exclusive_group()
-scripting_group.add_argument('--torchscript', dest='torchscript', action='store_true',
-                    help='torch.jit.script the full model')
-scripting_group.add_argument('--aot-autograd', default=False, action='store_true',
-                    help="Enable AOT Autograd support. (It's recommended to use this option with `--fuser nvfuser` together)")
+# scripting_group = parser.add_mutually_exclusive_group()
+# scripting_group.add_argument('--torchscript', dest='torchscript', action='store_true',
+#                     help='torch.jit.script the full model')
+# scripting_group.add_argument('--aot-autograd', default=False, action='store_true',
+#                     help="Enable AOT Autograd support. (It's recommended to use this option with `--fuser nvfuser` together)")
 parser.add_argument('--fuser', default='', type=str,
                     help="Select jit fuser. One of ('', 'te', 'old', 'nvfuser')")
 parser.add_argument('--fast-norm', default=False, action='store_true',
                     help='enable experimental fast-norm')
+parser.add_argument('--reparam', default=False, action='store_true',
+                    help='Reparameterize model')
+parser.add_argument('--model-kwargs', nargs='*', default={}, action=ParseKwargs)
+
+
+scripting_group = parser.add_mutually_exclusive_group()
+scripting_group.add_argument('--torchscript', default=False, action='store_true',
+                             help='torch.jit.script the full model')
+scripting_group.add_argument('--torchcompile', nargs='?', type=str, default=None, const='inductor',
+                             help="Enable compilation w/ specified backend (default: inductor).")
+scripting_group.add_argument('--aot-autograd', default=False, action='store_true',
+                             help="Enable AOT Autograd support.")
+
 parser.add_argument('--results-file', default='', type=str, metavar='FILENAME',
                     help='Output csv file for validation results (summary)')
+parser.add_argument('--results-format', default='csv', type=str,
+                    help='Format for results file one of (csv, json) (default: csv).')
 parser.add_argument('--real-labels', default='', type=str, metavar='FILENAME',
                     help='Real labels JSON file for imagenet evaluation')
 parser.add_argument('--valid-labels', default='', type=str, metavar='FILENAME',
@@ -144,36 +169,52 @@ parser.add_argument('--valid-labels', default='', type=str, metavar='FILENAME',
 parser.add_argument('--retry', default=False, action='store_true',
                     help='Enable batch size decay & retry for single model validation')
 
+
 def validate(args):
     # might as well try to validate something
     args.pretrained = args.pretrained or not args.checkpoint
     args.prefetcher = not args.no_prefetcher
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+
+    device = torch.device(args.device)
+
+    # resolve AMP arguments based on PyTorch / Apex availability
+    use_amp = None
     amp_autocast = suppress  # do nothing
     if args.amp:
-        if has_native_amp:
-            args.native_amp = True
-        elif has_apex:
-            args.apex_amp = True
+        if args.amp_impl == 'apex':
+            assert has_apex, 'AMP impl specified as APEX but APEX is not installed.'
+            assert args.amp_dtype == 'float16'
+            use_amp = 'apex'
+            _logger.info('Validating in mixed precision with NVIDIA APEX AMP.')
         else:
-            _logger.warning("Neither APEX or Native Torch AMP is available.")
-    assert not args.apex_amp or not args.native_amp, "Only one AMP mode should be set."
-    if args.native_amp:
-        amp_autocast = torch.cuda.amp.autocast
-        _logger.info('Validating in mixed precision with native PyTorch AMP.')
-    elif args.apex_amp:
-        _logger.info('Validating in mixed precision with NVIDIA APEX AMP.')
+            assert has_native_amp, 'Please update PyTorch to a version with native AMP (or use APEX).'
+            assert args.amp_dtype in ('float16', 'bfloat16')
+            use_amp = 'native'
+            amp_dtype = torch.bfloat16 if args.amp_dtype == 'bfloat16' else torch.float16
+            amp_autocast = partial(torch.autocast, device_type=device.type, dtype=amp_dtype)
+            _logger.info('Validating in mixed precision with native PyTorch AMP.')
     else:
         _logger.info('Validating in float32. AMP not enabled.')
 
     if args.fuser:
         set_jit_fuser(args.fuser)
+
     if args.fast_norm:
         set_fast_norm()
 
     # create model
-    model = create_model(args.model, pretrained=args.pretrained, num_classes=0, in_chans=3, global_pool=args.gp, scriptable=args.torchscript)
+    in_chans = 3
+    if args.in_chans is not None:
+        in_chans = args.in_chans
+    elif args.input_size is not None:
+        in_chans = args.input_size[0]
+        
+    model = create_model(args.model, pretrained=args.pretrained, num_classes=0, in_chans=3, global_pool=args.gp, scriptable=args.torchscript, **args.model_kwargs)
     # classifier only
-    model_cls = create_model(args.model, pretrained=args.pretrained, num_classes=1000, in_chans=3, global_pool=args.gp, scriptable=args.torchscript).get_classifier()
+    model_cls = create_model(args.model, pretrained=args.pretrained, num_classes=1000, in_chans=3, global_pool=args.gp, scriptable=args.torchscript, **args.model_kwargs).get_classifier()
 
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
@@ -182,6 +223,9 @@ def validate(args):
     if args.checkpoint:
         load_checkpoint(model, args.checkpoint, args.use_ema)
 
+    if args.reparam:
+        model = reparameterize_model(model)
+        
     param_count = sum([m.numel() for m in model.parameters()])
     _logger.info('Model %s created, param count: %d' % (args.model, param_count))
 
@@ -195,25 +239,30 @@ def validate(args):
     if args.test_pool:
         model, test_time_pool = apply_test_time_pool(model, data_config)
 
+    model = model.to(device)
+    model_cls = model_cls.to(device)
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+        model_cls = model_cls.to(memory_format=torch.channels_last)
+        
     if args.torchscript:
-        torch.jit.optimized_execution(True)
+        assert not use_amp == 'apex', 'Cannot use APEX AMP with torchscripted model'
         model = torch.jit.script(model)
-    if args.aot_autograd:
+    elif args.torchcompile:
+        assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
+        torch._dynamo.reset()
+        model = torch.compile(model, backend=args.torchcompile)
+    elif args.aot_autograd:
         assert has_functorch, "functorch is needed for --aot-autograd"
         model = memory_efficient_fusion(model)
 
-    model = model.cuda()
-    model_cls = model_cls.cuda()
-    if args.apex_amp:
+    if use_amp == 'apex':
         model = amp.initialize(model, opt_level='O1')
-
-    if args.channels_last:
-        model = model.to(memory_format=torch.channels_last)
 
     if args.num_gpu > 1:
         model = torch.nn.DataParallel(model, device_ids=list(range(args.num_gpu)))
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
 
   
     # dataset = create_dataset(
@@ -251,7 +300,9 @@ def validate(args):
         std=data_config['std'],
         num_workers=args.workers,
         crop_pct=crop_pct,
+        crop_mode=data_config['crop_mode'],
         pin_memory=args.pin_mem,
+        device=device,
         tf_preprocessing=args.tf_preprocessing)
 
     batch_time = AverageMeter()
@@ -278,8 +329,8 @@ def validate(args):
         end = time.time()
         for batch_idx, (x_b, y_b) in enumerate(loader):
             if args.no_prefetcher:
-                y_b = y_b.cuda()
-                x_b = x_b.cuda()
+                y_b = y_b.to(device)
+                x_b = x_b.to(device)
             if args.channels_last:
                 x_b = x_b.contiguous(memory_format=torch.channels_last)
 
@@ -360,7 +411,8 @@ def _try_run(args, initial_batch_size):
     while batch_size:
         args.batch_size = batch_size * args.num_gpu  # multiply by num-gpu for DataParallel case
         try:
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available() and 'cuda' in args.device:
+                torch.cuda.empty_cache()
             results = validate(args)
             return results
         except RuntimeError as e:
@@ -374,6 +426,7 @@ def _try_run(args, initial_batch_size):
     _logger.error(f'{args.model} failed to validate ({error_str}).')
     return results
 
+_NON_IN1K_FILTERS = ['*_in21k', '*_in22k', '*in12k', '*_dino', '*fcmae', '*seer']
 
 def main():
     setup_default_logging()
@@ -390,11 +443,17 @@ def main():
         if args.model == 'all':
             # validate all models in a list of names with pretrained checkpoints
             args.pretrained = True
-            model_names = list_models(pretrained=True, exclude_filters=['*_in21k', '*_in22k', '*_dino'])
+            model_names = list_models(
+                pretrained=True,
+                exclude_filters=_NON_IN1K_FILTERS,
+            )
             model_cfgs = [(n, '') for n in model_names]
         elif not is_model(args.model):
             # model name doesn't exist, try as wildcard filter
-            model_names = list_models(args.model)
+            model_names = list_models(
+                args.model,
+                pretrained=True,
+            )
             model_cfgs = [(n, '') for n in model_names]
 
         if not model_cfgs and os.path.isfile(args.model):
@@ -420,13 +479,13 @@ def main():
         except KeyboardInterrupt as e:
             pass
         results = sorted(results, key=lambda x: x['top1'], reverse=True)
-        if len(results):
-            write_results(results_file, results)
     else:
         if args.retry:
             results = _try_run(args, args.batch_size)
         else:
             results = validate(args)
+    if args.results_file:
+        write_results(args.results_file, results, format=args.results_format)
     # output results in JSON to stdout w/ delimiter for runner script
     print(f'--result\n{json.dumps(results, indent=4)}')
 

@@ -16,7 +16,6 @@ Calibration methods include:
 
 #%%
 import pandas as pd
-# import torch
 import faiss
 from argparse import ArgumentParser
 from sklearn.preprocessing import KBinsDiscretizer
@@ -29,43 +28,31 @@ import matplotlib
 import pickle
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-# from temperature_scaling import *
 from netcal.scaling import TemperatureScaling
 from netcal.binning import HistogramBinning
-
+from utils.metrics import evaluate
+from utils.ensemble_temperature_scaling import MultiIsotonicRegression, EnsembleTemperatureScaling
+from utils.parameterized_temp_scaling import ParameterizedTemperatureScaling
+from utils.parameterized_temp_scaling import ParameterizedNeighborTemperatureScaling
+from netcal.binning import HistogramBinning
+from netcal.binning import IsotonicRegression
+import torch
 
 def check_manual_seed(seed):
     random.seed(seed)
-    # torch.manual_seed(seed) # for cpu
-    # torch.cuda.manual_seed(seed) # for single GPU
-    # torch.cuda.manual_seed_all(seed) # for all GPUs
+    torch.manual_seed(seed) # for cpu
+    torch.cuda.manual_seed(seed) # for single GPU
+    torch.cuda.manual_seed_all(seed) # for all GPUs
     print("Using seed: {seed}".format(seed=seed))
-    
+
+
 
 #%%
 parser = ArgumentParser()
 
+parser.add_argument("--dataset_name", type=str, default="inaturalist")
 parser.add_argument("--data_dir", type=str, default="/home/miao/repo2022/yeeef/newt/benchmark/output")
-# parser.add_argument("--download_weights", type=int, default=0, choices=[0, 1])
-# parser.add_argument("--test_phase", type=int, default=0, choices=[0, 1])
-# parser.add_argument("--dev", type=int, default=0, choices=[0, 1])
-# parser.add_argument( "--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"] )
-
-# parser.add_argument("--classifier", type=str, default="resnet18")
-# parser.add_argument("--pretrained", type=int, default=0, choices=[0, 1])
-
-# parser.add_argument("--precision", type=int, default=32, choices=[16, 32])
-# parser.add_argument("--batch_size", type=int, default=256)
-# parser.add_argument("--max_epochs", type=int, default=100)
-# parser.add_argument("--num_workers", type=int, default=8)
-# parser.add_argument("--gpu_id", type=str, default="3")
-
-# parser.add_argument("--learning_rate", type=float, default=1e-2)
-# parser.add_argument("--pin_mem", type=bool, default=False)
-# parser.add_argument("--weight_decay", type=float, default=1e-2)
-
 parser.add_argument("--normalize", type=bool, default=True)
-
 parser.add_argument("--num_neighbors", type=int, default=10)
 parser.add_argument("--random_seed", type=int, default=2022)
 parser.add_argument("--distance_measure", type=str, default="L2") # L2, cosine, IVFFlat, IVFPQ
@@ -103,6 +90,11 @@ print("Loading model: {}".format(args.model))
 # confs = np.max(logits, axis=-1)
 # preds = np.argmax(logits, axis=-1)
 ys, zs, logits, confs, preds = pickle.load(open(osp.join(args.data_dir, 'out_{}.p'.format(args.model)), 'rb'))
+
+if args.normalize:
+    zs = zs / np.linalg.norm(zs, axis=1, keepdims=True)
+print("zs.shape: {}".format(zs.shape))
+
 # TODO
 if 'svhn' in args.model:
     confs = np.max(confs, axis=-1)
@@ -111,12 +103,10 @@ num_classes = logits.shape[1]
 val_acc = (ys == preds).mean()
 print('Val acc: {:.4f}, mean conf: {:.4f}'.format(val_acc, confs.mean()))
 
-if args.normalize:
-    zs = zs / np.linalg.norm(zs, axis=1, keepdims=True)
-print("zs.shape: {}".format(zs.shape))
 
 img_dir = "plots/{:d}_{}".format(int((ys == preds).mean()*1000), args.model)
 os.makedirs(img_dir, exist_ok=True)
+
 
 # split dataset into two parts
 try:
@@ -131,8 +121,6 @@ val_ys, val_zs, val_logits, val_preds, val_confs = ys[val_idx], zs[val_idx], log
 test_ys, test_zs, test_logits, test_preds, test_confs = ys[test_idx], zs[test_idx], logits[test_idx], preds[test_idx], confs[test_idx]
 val_probs = softmax(val_logits, axis=-1)
 test_probs = softmax(test_logits, axis=-1)
-
-
 
 # initialize a KDTree / or other search engine
 dim = val_zs.shape[1]
@@ -168,13 +156,13 @@ test_proximity = np.exp(-test_dists)
 val_knndists = np.mean(val_proximity, axis=1)
 test_knndists = np.mean(test_proximity, axis=1)
 
+
 #%%
 #################### CALIBRATION METHOD ############################
 
 compare_methods = ['conf', 'temperature_scaling', 'pts', 'pts_knndist', 'ensemble_ts', 'multi_isotonic_regression']
-# ['conf', 'temperature_scaling', 'density_estimation', 'pts', 'pts_knndist', 'histogram_binning', 'isotonic_regression', 'ensemble_ts', 'multi_isotonic_regression']
-#  ['histogram_binning', 'isotonic_regression', 'multi_isotonic_regression'] , 'multi_isotonic_regression_conf_proximity', 'multi_proximity_isotonic_regression'
-# compare_methods = ['conf', 'pts', 'pts_conf', 'pts_knndist']
+original_compare_methods = compare_methods.copy()
+
 
 test_results = {'val':{}, 'test':{}}
 if 'conf' in compare_methods:
@@ -234,9 +222,6 @@ if 'histogram_binning' in compare_methods:
     probs_val = histbin.fit_transform(softmax(val_logits, axis=-1), val_ys)
     probs_test = histbin.transform(softmax(test_logits, axis=-1))
     
-    # confs_hist_val = np.max(probs_val,axis=-1)
-    # confs_hist_test = np.max(probs_test,axis=-1)
-    
     test_results['val']['histogram_binning'] =  probs_val
     test_results['test']['histogram_binning'] =  probs_test
     
@@ -255,25 +240,6 @@ if 'isotonic_regression' in compare_methods:
     test_results['test']['isotonic_regression'] =  probs_test
 
 
-
-# if 'custom_density_estimation' in compare_methods:
-#     # TODO
-#     from utils.density_ratio_calibration import CustomizeKDECal
-    
-#     kernel = 'sklearn_kde'
-#     kernel_func = 'gaussian'
-#     bandwidth = 0.04
-#     mirror = False
-#     calibrator = CustomizeKDECal(kernel=kernel, kernel_func=kernel_func, bandwidth=bandwidth, mirror=mirror) 
-    
-#     calibrator.fit(val_confs, val_preds, val_ys, val_knndists, is_conf=True)
-#     conf_reg_val = calibrator.predict(val_confs, val_knndists, is_conf=True)
-#     conf_reg_test = calibrator.predict(test_logits, test_knndists, is_conf=False)
-    
-#     test_results['val']['custom_density_estimation'] = conf_reg_val
-#     test_results['test']['custom_density_estimation'] = conf_reg_test
-#     np.save(osp.join(img_dir, "test_custom_density_estimation_{}.npy".format(args.distance_measure)), conf_reg_test)  
-    
 
 if 'density_estimation' in compare_methods:
     from utils.density_ratio_calibration import DensityRatioCalibration
@@ -384,7 +350,7 @@ if 'multi_isotonic_regression' in compare_methods:
 kde_method = ['conf', 'temperature_scaling', 'pts', 'pts_knndist', 'ensemble_ts']
 
 for method in kde_method:
-    if method not in compare_methods:
+    if method not in original_compare_methods:
         continue
     val_prob_score = test_results['val'][method]
     test_prob_score = test_results['test'][method]
@@ -398,8 +364,8 @@ for method in kde_method:
     test_results['test'][method+'_kde'] = prob_reg_test
     compare_methods.append(method+'_kde') 
     
-########################## KDE PLUG_PlAY ########################################
-binning_method =['histogram_binning', 'isotonic_regression', 'multi_isotonic_regression'] # 'multi_isotonic_regression', 'histogram_binning', 'isotonic_regression'
+########################## BIN-MEAN-SHIFT PLUG_PlAY ########################################
+binning_method =['histogram_binning', 'isotonic_regression', 'multi_isotonic_regression']
 from utils.multi_proximity_isotonic import BinMeanShift
 from utils.ensemble_temperature_scaling import MultiIsotonicRegression
 from netcal.binning import IsotonicRegression, HistogramBinning
@@ -425,27 +391,25 @@ for method in binning_method:
     
 # %%
 #################### TESTING ECE LOSS ############################
-# TODO test how many knnbins are needed and suitable
 knnbin = 10
 confbin = 15
-file_name_to_save = "res_dir/metrics_table_inaturalist_knnbin{}_confbin{}.csv".format(knnbin, confbin)
-
+file_name_to_save = f"res_dir/metrics_table_{args.dataset_name}_knnbin{knnbin}_confbin{confbin}.csv"
             
 from utils.metrics import evaluate
 
+conf_normalize = False
 for method in compare_methods:
     test_prob_score = test_results['test'][method]
 
-    for conf_normalize in [True, False]:
-        accuracy_change, ece, mce, ace, toplabel_ece, da_ece, da_mce, loss, brier = evaluate(test_prob_score, test_preds, test_ys, test_knndists, verbose = False, normalize = conf_normalize, conf_bins = confbin, knn_bins=knnbin)
 
-        with open(file_name_to_save, "a") as f:
-            write_list = [args.model, val_acc, method, args.random_seed, args.distance_measure, accuracy_change, ece, mce, ace, toplabel_ece, da_ece, da_mce, loss, brier, confbin, knnbin, proximity_bin, conf_normalize]
-            entry = ','.join([str(item) for item in write_list])
-            f.write(entry)
-            f.write("\n")
+    ece, mce, ace, piece = evaluate(test_prob_score, test_preds, test_ys, test_knndists, verbose = False, normalize = conf_normalize, conf_bins = confbin, knn_bins=knnbin)
 
-#%%
+    with open(file_name_to_save, "a") as f:
+        write_list = [args.model, val_acc, method, args.random_seed, args.distance_measure, ece, mce, ace, piece, confbin, knnbin, proximity_bin, conf_normalize]
+        entry = ','.join([str(item) for item in write_list])
+        f.write(entry)
+        f.write("\n")
+
 ################# TEST PROXIMITY BIAS MITIGATION VISUAlIZATION ############################
 test_df = pd.DataFrame({'ys':test_ys, 'knndist':test_knndists, 'pred':test_preds})
 
@@ -476,36 +440,4 @@ plt.show()
 plt.savefig(osp.join(img_dir, "proximity_bias_{}_K{}".format(args.model, K)), dpi=300)
 
 
-################## TEST PROXIMITY BIAS MITIGATION VISUAlIZATION ############################
-# uncomment to save the proximity bias plot
-# test_df = pd.DataFrame({'ys':test_ys, 'knndist':test_knndists, 'pred':test_preds})
-
-# test_df['correct'] = (test_df.pred == test_df.ys).astype('int')
-
-# test_df['knn_bin'] = KBinsDiscretizer(n_bins=6, encode='ordinal').fit_transform(test_knndists.reshape(-1, 1))
-# # draw the plot on test dataset
-# group_correct = test_df.groupby('knn_bin')['correct'].mean()
-# group_knn = test_df.groupby('knn_bin')['knndist'].mean()
-
-
-# plt.figure()
-# colors = plt.cm.BuPu(np.linspace(0, 0.5, 2))
-# plt.plot(group_knn, group_correct, 'bx-', label='acc')
-# # plt.plot(group_knn, group_confs, 'go-', label='conf')
-
-# # compare_methods = ['conf', 'temperature_scaling', 'density_estimation', 'pts']
-# # label_names = ['conf', 'conf_temp', 'ours', 'conf_pts']
-# label_names = ['conf', 'pts', 'pts_conf', 'pts_knndist']
-# markers = ['go-', 'y+-', 'r^-', 'c+-']
-# for method, marker, label in zip(compare_methods, markers, label_names):
-#     test_df[method] = test_results[method]
-#     group_confs_reg = test_df.groupby('knn_bin')[method].mean()
-#     plt.plot(group_knn, group_confs_reg, marker, label=label)
-
-# plt.title("{}".format(args.model))
-# plt.legend()
-# plt.grid(True)
-# plt.xlabel("avg-to-knn distance")
-# plt.show()
-# plt.savefig(osp.join(img_dir, "pts_proximity_bias_{}_K{}".format(args.model, K)), dpi=300)
 

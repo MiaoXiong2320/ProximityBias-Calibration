@@ -126,9 +126,9 @@ ys, zs, logits, confs, preds = pickle.load(open(os.path.join(args.data_dir, 'out
 
 we provide scripts regarding `ImageNet/ImageNet-Sketch/ImageNet-C` datasets that utilizes models from the Timm library (https://github.com/huggingface/pytorch-image-models) as backbone models to facilitate the calculation of various parameters (`ys`, `zs`, `logits`, `confs`, `preds`). 
 ```bash
-bash pytorch_image_models/imagenet_inference.sh
-bash pytorch_image_models/imagenet_sketch_inference.sh
-bash pytorch_image_models/imagenet_c_inference.sh
+bash scripts/scripts/precompute_intermediate_results_imagenet.sh
+bash scripts/precompute_imagenet_sketch.sh
+bash scripts/precompute_imagenet_c.sh
 ```
 
 ##### Script Arguments
@@ -174,12 +174,27 @@ Execution of this script requires the provision of the following parameters:
 | Argument          | Example           | Description   |
 | ----------------- | ----------------- | ------------- |
 | `--dataset_name`  | `imagenet` | The specific dataset intended for use. |
-| `--data_dir`      | `pytorch_image_models/intermediate_output/imagenet/` | The designated path for storing intermediate embeddings of the precomputed dataset. |
+| `--data_dir`      | `intermediate_output/imagenet/` | The designated path for storing intermediate embeddings of the precomputed dataset. |
 | `--normalize`     | `True` | Indicates whether to normalize the embedding space. |
 | `--num_neighbors` | `10` | The number of neighbors utilized for proximity calculation. |
 | `--random_seed`   | `2023` | Any preferential number ensuring consistent results across trials. |
 | `--distance_measure` | `L2` | The metric adopted for neighbor distance calculations. Options include "L2," "cosine," "IVFFlat," and "IVFPQ." Refer to 'faiss' for detailed distance definitions. |
 | `--model`         | `ResNet50` | Specifies the desired model, with current support limited to models from `timm`. For computations involving alternative models, please refer to our variant scripts such as `compute_calibration_metrics_nlp.py` or `compute_calibration_metrics_distribution_shift.py`. |
+
+### Reproducibility
+
+
+For iNaturalist 2021, the pretrained model is downloaded from this repo: https://github.com/visipedia/newt 
+The evaluation pipeline is obtained by executing the following script:
+```bash
+bash scripts/compute_calibration_metrics_inaturalist.sh
+```
+
+For ImageNet-Sketch:
+```bash
+bash scripts/precompute_imagenet_sketch.sh
+bash scripts/compute_calibration_metrics_imagenet_sketch.sh
+```
 
 
 ## Reference Repositories
@@ -189,7 +204,7 @@ Execution of this script requires the provision of the following parameters:
 
 
 ## Citation
-Please cite the following paper when using this code. 
+Please cite the following paper when you find our paper or code useful. 
 ```
 @inproceedings{xiong2023proximitybias,
     title={Proximity-Informed Calibration for Deep Neural Networks},
