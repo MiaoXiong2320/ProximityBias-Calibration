@@ -198,9 +198,9 @@ bash scripts/compute_calibration_metrics_imagenet_sketch.sh
 
 
 ## Reference Repositories
-- Timm: [https://github.com/lm-sys/FastChat](https://github.com/huggingface/pytorch-image-models)
-- Faiss: [https://github.com/XiangLi1999/ContrastiveDecoding](https://github.com/facebookresearch/faiss)
-- net:cal Uncertainty Calibration: [https://github.com/sylinrl/TruthfulQA](https://github.com/EFS-OpenSource/calibration-framework)
+- Timm: [https://github.com/huggingface/pytorch-image-models](https://github.com/huggingface/pytorch-image-models)
+- Faiss: [https://github.com/facebookresearch/faiss](https://github.com/facebookresearch/faiss)
+- net:cal Uncertainty Calibration: [https://github.com/EFS-OpenSource/calibration-framework](https://github.com/EFS-OpenSource/calibration-framework)
 
 
 ## Citation
